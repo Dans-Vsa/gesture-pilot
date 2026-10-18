@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gesture-pilot"
+dynamic = ["version"]
+description = "Control your computer with hand gestures from a webcam."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Dans-Vsa" }]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python>=4.9",
+    "mediapipe>=0.10.14",
+]
+keywords = ["computer-vision", "mediapipe", "opencv", "gesture-recognition", "hand-tracking"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+gesture-pilot = "gesture_pilot.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Dans-Vsa/gesture-pilot"
+
+[tool.setuptools.dynamic]
+version = { attr = "gesture_pilot.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
