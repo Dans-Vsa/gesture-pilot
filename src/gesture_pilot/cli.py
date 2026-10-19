@@ -46,7 +46,73 @@ def build_parser() -> argparse.ArgumentParser:
     _add_source_args(pv)
     pv.add_argument("--no-window", action="store_true", help="headless: process frames without a window")
     pv.add_argument("--snapshot", type=Path, help="save the last processed frame to this image file")
+
+    tr = sub.add_parser(
+        "track",
+        help="track hands and draw the 21-landmark skeleton",
+        description="Detect and track hands with MediaPipe and draw their skeletons. "
+        "Press q or Esc to quit.",
+    )
+    _add_source_args(tr)
+    _add_tracker_args(tr)
+
+    rc = sub.add_parser(
+        "recognize",
+        help="recognise gestures and print debounced gesture events",
+        description="Track hands, recognise rule-based gestures (open palm, fist, point, peace, "
+        "thumbs up/down, OK, pinch) and print an event whenever a gesture is held steadily. "
+        "Press q or Esc to quit.",
+    )
+    _add_source_args(rc)
+    _add_tracker_args(rc)
+    rc.add_argument(
+        "--stable-frames", type=_positive_int, default=5,
+        help="frames a gesture must be held before it fires (default: 5)",
+    )
+    rc.add_argument(
+        "--cooldown", type=_non_negative_float, default=0.5,
+        help="seconds after an event during which no other event fires (default: 0.5)",
+    )
+    rc.add_argument(
+        "--smoothing", type=_alpha, default=0.6,
+        help="landmark smoothing factor in (0, 1]; 1 disables smoothing (default: 0.6)",
+    )
     return parser
+
+
+def _non_negative_float(value: str) -> float:
+    number = float(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return number
+
+
+def _alpha(value: str) -> float:
+    number = float(value)
+    if not 0 < number <= 1:
+        raise argparse.ArgumentTypeError("must be in (0, 1]")
+    return number
+
+
+def _confidence(value: str) -> float:
+    number = float(value)
+    if not 0 <= number <= 1:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return number
+
+
+def _add_tracker_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--model-path", type=Path,
+        help="hand landmarker model (default: $GESTURE_PILOT_MODEL or models/hand_landmarker.task)",
+    )
+    parser.add_argument("--max-hands", type=_positive_int, default=2, help="hands to track (default: 2)")
+    parser.add_argument(
+        "--min-confidence", type=_confidence, default=0.5,
+        help="minimum detection/tracking confidence (default: 0.5)",
+    )
+    parser.add_argument("--no-window", action="store_true", help="headless: process frames without a window")
+    parser.add_argument("--snapshot", type=Path, help="save the last processed frame to this image file")
 
 
 def _add_source_args(parser: argparse.ArgumentParser) -> None:
@@ -124,11 +190,8 @@ def cmd_preview(args: argparse.Namespace) -> int:
     if last is None:
         print(f"error: no frames received from {source.name}", file=sys.stderr)
         return 1
-    if args.snapshot:
-        args.snapshot.parent.mkdir(parents=True, exist_ok=True)
-        if not cv2.imwrite(str(args.snapshot), last):
-            print(f"error: could not write snapshot {args.snapshot}", file=sys.stderr)
-            return 1
+    if args.snapshot and not _save_snapshot(args.snapshot, last):
+        return 1
     height, width = last.shape[:2]
     print(
         f"{source.name}: {counter.frames} frames, {width}x{height}, "
@@ -137,9 +200,127 @@ def cmd_preview(args: argparse.Namespace) -> int:
     return 0
 
 
+def _save_snapshot(path: Path, frame: object) -> bool:
+    import cv2
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), frame):
+        print(f"error: could not write snapshot {path}", file=sys.stderr)
+        return False
+    return True
+
+
+def _run_tracking(args: argparse.Namespace, *, recognize: bool) -> int:
+    import time
+
+    import cv2
+
+    from gesture_pilot.fps import FPSCounter
+    from gesture_pilot.gestures import NONE, classify
+    from gesture_pilot.overlay import draw_fps, draw_hand, draw_label
+    from gesture_pilot.smoothing import LandmarkSmoother, MultiHandStabilizer
+    from gesture_pilot.sources import CameraSource, SourceError, open_source
+    from gesture_pilot.tracker import HandTracker, TrackerError
+
+    try:
+        tracker = HandTracker(
+            args.model_path,
+            max_hands=args.max_hands,
+            min_detection_confidence=args.min_confidence,
+            min_presence_confidence=args.min_confidence,
+            min_tracking_confidence=args.min_confidence,
+        )
+    except TrackerError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        source = open_source(args.source, width=args.width, height=args.height, max_frames=args.max_frames)
+    except SourceError as exc:
+        tracker.close()
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    mirror = isinstance(source, CameraSource) and not args.no_mirror
+    frame_ms = 1000.0 / (source.fps or 30.0)
+    smoother = LandmarkSmoother(args.smoothing) if recognize else None
+    stabilizer = MultiHandStabilizer(args.stable_frames, args.cooldown) if recognize else None
+    counter = FPSCounter()
+    start = time.monotonic()
+    frames_with_hands = 0
+    events = 0
+    last = None
+
+    with tracker, source:
+        for index, frame in enumerate(source):
+            if mirror:
+                frame = cv2.flip(frame, 1)
+            if source.live:
+                timestamp_ms = int((time.monotonic() - start) * 1000)
+            else:
+                timestamp_ms = int(index * frame_ms)
+            hands = tracker.detect(frame, timestamp_ms)
+            if hands:
+                frames_with_hands += 1
+
+            if recognize:
+                hands = smoother.update(hands)
+                labels: dict[str, str] = {}
+                for hand in hands:
+                    labels.setdefault(hand.handedness, classify(hand).gesture)
+                for event in stabilizer.update(labels, timestamp_ms / 1000):
+                    events += 1
+                    print(f"{event.timestamp:8.2f}s  {event.handedness:<5}  {event.gesture}", flush=True)
+                for hand in hands:
+                    gesture = labels.get(hand.handedness, NONE)
+                    held = stabilizer.active(hand.handedness)
+                    marker = " *" if held != NONE and held == gesture else ""
+                    draw_hand(frame, hand, label=f"{hand.handedness}: {gesture}{marker}")
+            else:
+                for hand in hands:
+                    draw_hand(frame, hand, label=f"{hand.handedness} {hand.score:.2f}")
+
+            draw_fps(frame, counter.tick())
+            if not hands:
+                draw_label(frame, "no hand", (10, 44), color=(120, 120, 255))
+            last = frame
+            if not args.no_window:
+                cv2.imshow(WINDOW_TITLE, frame)
+                if (cv2.waitKey(1) & 0xFF) in EXIT_KEYS:
+                    break
+            if args.max_frames and counter.frames >= args.max_frames:
+                break
+    if not args.no_window:
+        cv2.destroyAllWindows()
+
+    if last is None:
+        print(f"error: no frames received from {source.name}", file=sys.stderr)
+        return 1
+    if args.snapshot and not _save_snapshot(args.snapshot, last):
+        return 1
+    rate = frames_with_hands * 100 / max(1, counter.frames)
+    summary = (
+        f"{source.name}: {counter.frames} frames, hands in {frames_with_hands} ({rate:.0f}%), "
+        f"average {counter.average:.1f} FPS"
+    )
+    if recognize:
+        summary += f", {events} gesture events"
+    print(summary)
+    return 0
+
+
+def cmd_track(args: argparse.Namespace) -> int:
+    return _run_tracking(args, recognize=False)
+
+
+def cmd_recognize(args: argparse.Namespace) -> int:
+    return _run_tracking(args, recognize=True)
+
+
 COMMANDS = {
     "download-model": cmd_download_model,
     "preview": cmd_preview,
+    "track": cmd_track,
+    "recognize": cmd_recognize,
 }
 
 

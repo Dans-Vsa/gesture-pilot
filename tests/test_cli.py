@@ -66,3 +66,48 @@ def test_download_model_command_reports_errors(
     monkeypatch.setattr(model, "MODEL_URL", (tmp_path / "missing").as_uri())
     assert main(["download-model", "--path", str(tmp_path / "m.task"), "--quiet"]) == 1
     assert "could not download" in capsys.readouterr().err
+
+
+LOCAL_MODEL = Path(__file__).resolve().parents[1] / "models" / model.MODEL_FILENAME
+needs_model = pytest.mark.skipif(
+    not model.verify_model(LOCAL_MODEL), reason="hand landmarker model not downloaded"
+)
+
+
+@pytest.mark.parametrize("command", ["track", "recognize"])
+def test_tracking_commands_report_missing_model(
+    command: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code = main([command, "--source", "test", "--no-window", "--model-path", str(tmp_path / "x.task")])
+    assert code == 1
+    assert "model not found" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "extra", [["--stable-frames", "0"], ["--cooldown", "-1"], ["--smoothing", "0"], ["--min-confidence", "2"]]
+)
+def test_recognize_rejects_bad_options(extra: list[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["recognize", *extra])
+
+
+@needs_model
+def test_track_headless_on_test_pattern(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    snap = tmp_path / "track.png"
+    code = main(
+        ["track", "--source", "test", "--width", "160", "--height", "120", "--max-frames", "3",
+         "--no-window", "--model-path", str(LOCAL_MODEL), "--snapshot", str(snap)]
+    )
+    assert code == 0
+    assert "test pattern: 3 frames, hands in 0 (0%)" in capsys.readouterr().out
+    assert cv2.imread(str(snap)).shape == (120, 160, 3)
+
+
+@needs_model
+def test_recognize_headless_on_test_pattern(capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(
+        ["recognize", "--source", "test", "--width", "160", "--height", "120", "--max-frames", "3",
+         "--no-window", "--model-path", str(LOCAL_MODEL)]
+    )
+    assert code == 0
+    assert "0 gesture events" in capsys.readouterr().out
