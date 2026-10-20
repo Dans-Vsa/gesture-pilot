@@ -14,8 +14,12 @@ dependencies = [
     "numpy>=1.26",
     "opencv-python>=4.9",
     "mediapipe>=0.10.14",
+    "scikit-learn>=1.4",
+    "joblib>=1.3",
+    "pynput>=1.7",
+    "tomli>=2.0; python_version < '3.11'",
 ]
-keywords = ["computer-vision", "mediapipe", "opencv", "gesture-recognition", "hand-tracking"]
+keywords = ["computer-vision", "mediapipe", "opencv", "gesture-recognition", "hand-tracking", "scikit-learn", "automation"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
