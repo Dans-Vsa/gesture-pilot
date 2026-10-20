@@ -7,7 +7,7 @@ and [OpenCV](https://opencv.org/), recognises gestures (rule-based and trainable
 and maps them to actions such as play/pause, volume, mouse movement and scrolling.
 Everything runs locally on the CPU — no cloud APIs, no API keys.
 
-> **Status:** in development (v0.2.0). Milestone 2 of 4 is done — see the roadmap below.
+> **Status:** in development (v0.3.0). Milestone 3 of 4 is done — see the roadmap below.
 
 ## Features
 
@@ -18,8 +18,10 @@ Everything runs locally on the CPU — no cloud APIs, no API keys.
 - [x] Landmark normalisation — wrist origin, palm-size scale, left hands mirrored to right, so rules and classifiers ignore position, size and handedness
 - [x] Rule-based gestures — open palm, fist, point, peace, thumbs up, thumbs down, OK, pinch (`recognize`)
 - [x] Temporal smoothing — landmark moving average, debounce (gesture must be held for N frames), no repeats while held, cooldown between events
-- [ ] Trainable gestures — record your own labelled samples and train a scikit-learn classifier (`record`, `train`)
-- [ ] Actions — TOML mapping from gestures to media keys, volume, key combos, mouse and scroll, with a safety gesture and `--dry-run` (`run`)
+- [x] Trainable gestures — record your own labelled samples to CSV and train a scikit-learn classifier (SVM, k-NN or random forest) with a hold-out report and confusion matrix (`record`, `train`, `--model`)
+- [x] Synthetic demo data — `record --synthetic N` generates samples of the built-in gestures, so you can try training without a camera
+- [x] Actions — TOML mapping from gestures to media keys, volume, key combos, clicks, scrolling and cursor movement (`init-config`, `run`)
+- [x] Safety — actions start disarmed, a toggle gesture arms/disarms them, optional left/right hand filter, `--dry-run` prints instead of acting
 - [ ] Polish — performance tuning, HUD, CI on Linux + Windows, v1.0.0
 
 ## Tech stack
@@ -28,8 +30,8 @@ Everything runs locally on the CPU — no cloud APIs, no API keys.
 | --- | --- |
 | Language | Python 3.10+ (developed on 3.12; use a version MediaPipe ships wheels for — not 3.14 yet) |
 | Vision | OpenCV (capture, drawing), MediaPipe Tasks `HandLandmarker` |
-| Numerics / ML | NumPy (scikit-learn planned for custom gestures in milestone 3) |
-| Actions | pynput (planned) |
+| Numerics / ML | NumPy, scikit-learn (custom gesture classifier), joblib (model files) |
+| Actions | pynput (keyboard + mouse), TOML config (`tomllib`) |
 | Tests | pytest — no camera needed |
 
 ## Setup
@@ -118,6 +120,85 @@ A gesture fires once while it is held; release it (or switch to another one)
 to fire again. The overlay shows the per-frame gesture of each hand, with `*`
 when it is the currently held (fired) gesture.
 
+### Custom gestures (record + train)
+
+Teach gesture-pilot your own gestures in three steps:
+
+```bash
+# 1. Record ~200 samples per gesture (3 s countdown, then hold the pose and move it around a bit)
+gesture-pilot record --label rock_on
+gesture-pilot record --label call_me
+gesture-pilot record --label fist          # include the built-in poses you also want to keep
+
+# 2. Train a classifier (prints precision/recall per gesture and a confusion matrix)
+gesture-pilot train                        # data/gestures.csv -> models/gestures.joblib
+
+# 3. Use it instead of the rule-based recogniser
+gesture-pilot recognize --model models/gestures.joblib
+```
+
+Samples are stored as normalised landmarks (63 numbers per hand), so position,
+size and left/right hand do not matter. `--algorithm svm|knn|forest` picks the
+classifier (default: calibrated RBF SVM); predictions below `--min-score`
+(default 0.6) count as `none`. Each gesture needs at least 10 samples.
+
+No camera at hand? Generate a demo dataset of the eight built-in gestures:
+
+```bash
+gesture-pilot record --synthetic 100 --output data/demo.csv
+gesture-pilot train data/demo.csv --output models/demo.joblib
+```
+
+> Model files are joblib pickles — only load models you trained yourself.
+
+### Actions
+
+```bash
+gesture-pilot run --dry-run            # print what would happen, touch nothing
+gesture-pilot init-config              # write gestures.toml to customise the mapping
+gesture-pilot run --config gestures.toml
+gesture-pilot run --config gestures.toml --model models/gestures.joblib
+```
+
+Actions start **disarmed**. Hold the toggle gesture (default: `ok`) to arm them,
+and again to disarm; the overlay shows `ARMED` / `disarmed`. The default mapping:
+
+| Gesture | Action |
+| --- | --- |
+| `ok` | `toggle` — arm / disarm |
+| `open_palm` | play / pause |
+| `thumbs_up` / `thumbs_down` | volume up / down |
+| `peace` | next track |
+| `point` | move the cursor with your index finger |
+| `pinch` | left click |
+
+`gestures.toml` format:
+
+```toml
+[settings]
+start_armed = false   # or pass --armed
+stable_frames = 5     # frames a gesture must be held before it fires
+cooldown = 0.6        # seconds between events
+hand = "any"          # "Left" / "Right": only this hand triggers actions
+
+[actions]
+ok = "toggle"
+open_palm = "key:media_play_pause"
+peace = "key:ctrl+shift+t"
+fist = "scroll:-3"
+pinch = "click:left"
+point = "move:1500"
+rock_on = "key:f5"    # custom gestures from `train` work too
+```
+
+| Action | Meaning |
+| --- | --- |
+| `key:<keys>` | press a key or combo joined with `+`: letters/digits, `ctrl`, `shift`, `alt`, `cmd`, `enter`, `space`, `tab`, `esc`, arrows, `f1`–`f12`, `media_play_pause`, `media_next`, `media_previous`, `media_volume_up/down/mute` (aliases: `volume_up`, `mute`, `play_pause`, …) |
+| `click[:button[:count]]` | mouse click — `left` (default), `right`, `middle`; count 1–3 |
+| `scroll:<dy>` / `scroll:<dx>,<dy>` | scroll by wheel steps (positive = up / right) |
+| `move[:speed]` | while held, the cursor follows the index fingertip (relative; `speed` = pixels per frame width, default 1500) |
+| `toggle` | arm / disarm the other actions (at most one; with none, actions are always armed) |
+
 ### How the rules work
 
 1. Landmarks are normalised: wrist → origin, divided by the palm size
@@ -138,7 +219,9 @@ The tests never open a camera or a window and never touch the network: the
 model downloader is tested against local `file://` URLs, the sources use
 generated videos, images and the test pattern, and gesture rules are tested on
 synthetic hands from `gesture_pilot.synthetic` (with random rotation, scale,
-position, handedness and noise). Tests that need the real model are skipped
+position, handedness and noise). Classifiers are trained on generated
+datasets, and actions run against a recording `DryRunBackend` — tests never
+press real keys or move the mouse. Tests that need the real model are skipped
 when `models/hand_landmarker.task` has not been downloaded.
 
 ## Project structure
@@ -146,18 +229,25 @@ when `models/hand_landmarker.task` has not been downloaded.
 ```
 gesture-pilot/
 ├── src/gesture_pilot/
-│   ├── cli.py        # argparse CLI: download-model, preview, track, recognize
+│   ├── cli.py        # argparse CLI: download-model, preview, track, recognize,
+│   │                 #   record, train, init-config, run
 │   ├── model.py      # model download + SHA-256 verification
 │   ├── sources.py    # camera / video / image / test-pattern frame sources
 │   ├── tracker.py    # MediaPipe HandLandmarker wrapper (VIDEO mode)
 │   ├── landmarks.py  # Hand dataclass, landmark indices, normalisation
 │   ├── gestures.py   # finger states + rule-based gesture classifier
 │   ├── smoothing.py  # landmark smoothing, gesture debounce/cooldown
+│   ├── dataset.py    # labelled samples CSV, synthetic demo data
+│   ├── classifier.py # scikit-learn gesture classifier (train/save/load/predict)
+│   ├── actions.py    # action parsing, dry-run + pynput backends
+│   ├── config.py     # TOML gesture -> action mapping
+│   ├── controller.py # events -> actions, safety toggle, cursor movement
 │   ├── synthetic.py  # synthetic hand generator (tests, demo data)
 │   ├── fps.py        # smoothed FPS counter
 │   └── overlay.py    # labels, FPS badge, hand skeleton
 ├── tests/            # pytest suite (no camera required)
-├── models/           # downloaded model (git-ignored)
+├── models/           # downloaded / trained models (git-ignored)
+├── data/             # recorded datasets (git-ignored)
 ├── pyproject.toml
 └── LICENSE
 ```
@@ -166,7 +256,7 @@ gesture-pilot/
 
 1. ✅ Scaffold, model downloader, frame sources, `preview`
 2. ✅ Hand tracking, landmark normalisation, rule-based gestures with smoothing/debounce (`track`, `recognize`)
-3. Trainable gestures (`record`, `train`) and gesture → action mappings (`run`, `--dry-run`)
+3. ✅ Trainable gestures (`record`, `train`) and gesture → action mappings (`init-config`, `run`, `--dry-run`)
 4. Polish: performance options, HUD, CI, CHANGELOG, v1.0.0
 
 ## License
