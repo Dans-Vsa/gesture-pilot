@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from gesture_pilot import __version__
@@ -65,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_source_args(rc)
     _add_tracker_args(rc)
+    _add_classifier_args(rc)
     rc.add_argument(
         "--stable-frames", type=_positive_int, default=5,
         help="frames a gesture must be held before it fires (default: 5)",
@@ -73,11 +75,93 @@ def build_parser() -> argparse.ArgumentParser:
         "--cooldown", type=_non_negative_float, default=0.5,
         help="seconds after an event during which no other event fires (default: 0.5)",
     )
-    rc.add_argument(
+    _add_smoothing_arg(rc)
+
+    rec = sub.add_parser(
+        "record",
+        help="record labelled gesture samples to a CSV dataset",
+        description="Track one hand and append its normalised landmarks, labelled with --label, "
+        "to a CSV dataset for `train`. Use --synthetic to generate demo data for the built-in "
+        "gestures without a camera.",
+    )
+    rec.add_argument("--label", help="gesture name for the recorded samples, e.g. rock_on")
+    rec.add_argument(
+        "--output", type=Path, default=Path("data/gestures.csv"),
+        help="dataset file to append to (default: data/gestures.csv)",
+    )
+    rec.add_argument("--samples", type=_positive_int, default=200, help="samples to record (default: 200)")
+    rec.add_argument("--every", type=_positive_int, default=2, help="keep every Nth frame (default: 2)")
+    rec.add_argument(
+        "--delay", type=_non_negative_float, default=3.0,
+        help="seconds to get ready before recording from a camera (default: 3)",
+    )
+    rec.add_argument(
+        "--synthetic", type=_positive_int, metavar="N",
+        help="no camera: write N synthetic samples per built-in gesture instead",
+    )
+    rec.add_argument("--seed", type=int, default=0, help="random seed for --synthetic (default: 0)")
+    _add_source_args(rec)
+    _add_tracker_args(rec)
+    _add_smoothing_arg(rec)
+
+    trn = sub.add_parser(
+        "train",
+        help="train a custom gesture classifier from a CSV dataset",
+        description="Train a scikit-learn classifier on samples recorded with `record`, print a "
+        "hold-out evaluation and save the model (refitted on all samples) with joblib.",
+    )
+    trn.add_argument("dataset", type=Path, nargs="?", default=Path("data/gestures.csv"),
+                     help="dataset CSV (default: data/gestures.csv)")
+    trn.add_argument("--output", type=Path, default=Path("models/gestures.joblib"),
+                     help="where to save the model (default: models/gestures.joblib)")
+    trn.add_argument("--algorithm", choices=("svm", "knn", "forest"), default="svm",
+                     help="classifier (default: svm)")
+    trn.add_argument("--test-size", type=float, default=0.2, help="hold-out fraction (default: 0.2)")
+    trn.add_argument("--seed", type=int, default=0, help="random seed (default: 0)")
+
+    ic = sub.add_parser(
+        "init-config",
+        help="write an example gesture -> action config (TOML)",
+        description="Write the default gesture -> action mapping to a TOML file you can edit.",
+    )
+    ic.add_argument("path", type=Path, nargs="?", default=Path("gestures.toml"),
+                    help="file to create (default: gestures.toml)")
+    ic.add_argument("--force", action="store_true", help="overwrite an existing file")
+
+    run = sub.add_parser(
+        "run",
+        help="control the computer: map gestures to keys, mouse and scrolling",
+        description="Recognise gestures and perform the mapped actions (media keys, key combos, "
+        "clicks, scrolling, cursor movement). Actions start disarmed: hold the toggle gesture "
+        "(default: ok) to arm them. Use --dry-run to only print what would happen. "
+        "Press q or Esc to quit.",
+    )
+    run.add_argument("--config", type=Path, help="gesture -> action TOML (default: built-in mapping)")
+    run.add_argument("--dry-run", action="store_true", help="print actions instead of performing them")
+    run.add_argument("--armed", action="store_true", help="start armed (ignore start_armed in the config)")
+    _add_source_args(run)
+    _add_tracker_args(run)
+    _add_classifier_args(run)
+    _add_smoothing_arg(run)
+    return parser
+
+
+def _add_smoothing_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
         "--smoothing", type=_alpha, default=0.6,
         help="landmark smoothing factor in (0, 1]; 1 disables smoothing (default: 0.6)",
     )
-    return parser
+
+
+def _add_classifier_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--model", type=Path,
+        help="custom gesture classifier from `train` (default: built-in rule-based gestures)",
+    )
+    parser.add_argument(
+        "--min-score", type=_confidence, default=0.6,
+        help="minimum classifier confidence, otherwise 'none' (default: 0.6)",
+    )
 
 
 def _non_negative_float(value: str) -> float:
@@ -210,17 +294,66 @@ def _save_snapshot(path: Path, frame: object) -> bool:
     return True
 
 
-def _run_tracking(args: argparse.Namespace, *, recognize: bool) -> int:
+def _make_labeler(args: argparse.Namespace):
+    """Per-hand gesture function: the trained classifier with --model, else the rules."""
+    from gesture_pilot.gestures import classify
+
+    if getattr(args, "model", None) is None:
+        return lambda hand: classify(hand).gesture
+    from gesture_pilot.classifier import GestureClassifier
+
+    classifier = GestureClassifier.load(args.model, min_confidence=args.min_score)
+    return lambda hand: classifier.predict(hand).gesture
+
+
+def _run_tracking(args: argparse.Namespace, *, mode: str) -> int:
+    """Shared camera loop for ``track``, ``recognize``, ``run`` and ``record``."""
     import time
 
     import cv2
 
+    from gesture_pilot.dataset import sample_row
     from gesture_pilot.fps import FPSCounter
-    from gesture_pilot.gestures import NONE, classify
+    from gesture_pilot.gestures import NONE
     from gesture_pilot.overlay import draw_fps, draw_hand, draw_label
     from gesture_pilot.smoothing import LandmarkSmoother, MultiHandStabilizer
     from gesture_pilot.sources import CameraSource, SourceError, open_source
     from gesture_pilot.tracker import HandTracker, TrackerError
+
+    recognize = mode in ("recognize", "run")
+    labeler = controller = backend = None
+    stable_frames, cooldown = getattr(args, "stable_frames", 5), getattr(args, "cooldown", 0.5)
+    if recognize:
+        from gesture_pilot.classifier import ClassifierError
+
+        try:
+            labeler = _make_labeler(args)
+        except ClassifierError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    if mode == "run":
+        from gesture_pilot.actions import DryRunBackend, PynputBackend
+        from gesture_pilot.config import ConfigError, load_config
+        from gesture_pilot.controller import GestureController
+
+        try:
+            config = load_config(args.config)
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if args.armed:
+            config = replace(config, start_armed=True)
+        try:
+            backend = DryRunBackend() if args.dry_run else PynputBackend()
+        except RuntimeError as exc:
+            print(f"error: {exc} (use --dry-run to only print actions)", file=sys.stderr)
+            return 1
+        controller = GestureController(config, backend)
+        stable_frames, cooldown = config.stable_frames, config.cooldown
+        toggle = config.toggle_gesture
+        state = "armed" if controller.armed else f"disarmed - hold '{toggle}' to arm"
+        print(f"{len(config.actions)} gesture actions loaded ({state})"
+              + (", dry run" if args.dry_run else ""), flush=True)
 
     try:
         tracker = HandTracker(
@@ -242,10 +375,12 @@ def _run_tracking(args: argparse.Namespace, *, recognize: bool) -> int:
 
     mirror = isinstance(source, CameraSource) and not args.no_mirror
     frame_ms = 1000.0 / (source.fps or 30.0)
-    smoother = LandmarkSmoother(args.smoothing) if recognize else None
-    stabilizer = MultiHandStabilizer(args.stable_frames, args.cooldown) if recognize else None
+    smoother = LandmarkSmoother(args.smoothing) if mode != "track" else None
+    stabilizer = MultiHandStabilizer(stable_frames, cooldown) if recognize else None
     counter = FPSCounter()
     start = time.monotonic()
+    record_after = args.delay if mode == "record" and source.live else 0.0
+    rows: list[list[str]] = []
     frames_with_hands = 0
     events = 0
     last = None
@@ -261,20 +396,40 @@ def _run_tracking(args: argparse.Namespace, *, recognize: bool) -> int:
             hands = tracker.detect(frame, timestamp_ms)
             if hands:
                 frames_with_hands += 1
+            if smoother is not None:
+                hands = smoother.update(hands)
 
             if recognize:
-                hands = smoother.update(hands)
                 labels: dict[str, str] = {}
                 for hand in hands:
-                    labels.setdefault(hand.handedness, classify(hand).gesture)
+                    labels.setdefault(hand.handedness, labeler(hand))
                 for event in stabilizer.update(labels, timestamp_ms / 1000):
                     events += 1
-                    print(f"{event.timestamp:8.2f}s  {event.handedness:<5}  {event.gesture}", flush=True)
+                    line = f"{event.timestamp:8.2f}s  {event.handedness:<5}  {event.gesture}"
+                    if controller is not None:
+                        message = controller.handle_event(event)
+                        if message:
+                            line += f"  [{message}]"
+                    print(line, flush=True)
+                if controller is not None:
+                    controller.update_frame(hands, labels)
                 for hand in hands:
                     gesture = labels.get(hand.handedness, NONE)
                     held = stabilizer.active(hand.handedness)
                     marker = " *" if held != NONE and held == gesture else ""
                     draw_hand(frame, hand, label=f"{hand.handedness}: {gesture}{marker}")
+                if controller is not None:
+                    draw_label(frame, "ARMED" if controller.armed else "disarmed", (10, 70),
+                               color=(80, 220, 80) if controller.armed else (160, 160, 160))
+            elif mode == "record":
+                waiting = timestamp_ms / 1000 < record_after
+                if hands and not waiting and index % args.every == 0 and len(rows) < args.samples:
+                    rows.append(sample_row(args.label, hands[0]))
+                for hand in hands:
+                    draw_hand(frame, hand, label=args.label)
+                status = (f"get ready: {record_after - timestamp_ms / 1000:.0f}s" if waiting
+                          else f"recording {args.label}: {len(rows)}/{args.samples}")
+                draw_label(frame, status, (10, 70))
             else:
                 for hand in hands:
                     draw_hand(frame, hand, label=f"{hand.handedness} {hand.score:.2f}")
@@ -288,6 +443,8 @@ def _run_tracking(args: argparse.Namespace, *, recognize: bool) -> int:
                 if (cv2.waitKey(1) & 0xFF) in EXIT_KEYS:
                     break
             if args.max_frames and counter.frames >= args.max_frames:
+                break
+            if mode == "record" and len(rows) >= args.samples:
                 break
     if not args.no_window:
         cv2.destroyAllWindows()
@@ -305,15 +462,102 @@ def _run_tracking(args: argparse.Namespace, *, recognize: bool) -> int:
     if recognize:
         summary += f", {events} gesture events"
     print(summary)
+    if mode == "record":
+        return _save_recording(args.output, rows)
+    if mode == "run" and args.dry_run and backend.log:
+        moves = sum(1 for entry in backend.log if entry.startswith("move"))
+        print(f"dry run: {len(backend.log) - moves} actions, {moves} cursor moves")
+    return 0
+
+
+def _save_recording(path: Path, rows: list[list[str]]) -> int:
+    from gesture_pilot.dataset import DatasetError, append_samples
+
+    if not rows:
+        print("error: no samples recorded (no hand detected)", file=sys.stderr)
+        return 1
+    try:
+        written = append_samples(path, rows)
+    except DatasetError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"saved {written} samples to {path}")
     return 0
 
 
 def cmd_track(args: argparse.Namespace) -> int:
-    return _run_tracking(args, recognize=False)
+    return _run_tracking(args, mode="track")
 
 
 def cmd_recognize(args: argparse.Namespace) -> int:
-    return _run_tracking(args, recognize=True)
+    return _run_tracking(args, mode="recognize")
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    return _run_tracking(args, mode="run")
+
+
+def cmd_record(args: argparse.Namespace) -> int:
+    from gesture_pilot.dataset import DatasetError, append_samples, synthetic_samples, validate_label
+
+    if args.synthetic:
+        if args.label:
+            print("error: --synthetic generates the built-in gestures; do not pass --label", file=sys.stderr)
+            return 1
+        rows = synthetic_samples(args.synthetic, seed=args.seed)
+        try:
+            written = append_samples(args.output, rows)
+        except DatasetError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(f"saved {written} synthetic samples ({args.synthetic} per gesture) to {args.output}")
+        return 0
+    if not args.label:
+        print("error: --label is required (or use --synthetic N)", file=sys.stderr)
+        return 1
+    try:
+        validate_label(args.label)
+    except DatasetError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return _run_tracking(args, mode="record")
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    from gesture_pilot.classifier import ClassifierError, GestureClassifier, format_confusion
+    from gesture_pilot.dataset import DatasetError, load_dataset
+
+    try:
+        dataset = load_dataset(args.dataset)
+        print(f"{len(dataset)} samples: " + ", ".join(f"{k} {v}" for k, v in dataset.counts().items()))
+        classifier, report = GestureClassifier.train(
+            dataset, algorithm=args.algorithm, test_size=args.test_size, seed=args.seed
+        )
+    except (DatasetError, ClassifierError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:  # e.g. a test split too small for the number of classes
+        print(f"error: cannot split the dataset: {exc}", file=sys.stderr)
+        return 1
+    print(f"\n{report.algorithm}: trained on {report.train_samples}, tested on {report.test_samples}")
+    print(report.report)
+    print("confusion matrix (rows = true, columns = predicted):")
+    print(format_confusion(report))
+    classifier.save(args.output)
+    print(f"\naccuracy {report.accuracy:.1%} - model saved to {args.output}")
+    return 0
+
+
+def cmd_init_config(args: argparse.Namespace) -> int:
+    from gesture_pilot.config import DEFAULT_CONFIG
+
+    if args.path.exists() and not args.force:
+        print(f"error: {args.path} already exists (use --force to overwrite)", file=sys.stderr)
+        return 1
+    args.path.parent.mkdir(parents=True, exist_ok=True)
+    args.path.write_text(DEFAULT_CONFIG, encoding="utf-8")
+    print(f"wrote {args.path} - edit it, then run: gesture-pilot run --config {args.path}")
+    return 0
 
 
 COMMANDS = {
@@ -321,6 +565,10 @@ COMMANDS = {
     "preview": cmd_preview,
     "track": cmd_track,
     "recognize": cmd_recognize,
+    "record": cmd_record,
+    "train": cmd_train,
+    "init-config": cmd_init_config,
+    "run": cmd_run,
 }
 
 
