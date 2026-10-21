@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install system libraries for OpenCV
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+
+      - name: Install package
+        run: python -m pip install -e ".[dev]"
+
+      - name: Cache hand landmarker model
+        uses: actions/cache@v4
+        with:
+          path: models/hand_landmarker.task
+          key: hand-landmarker-float16-1
+
+      - name: Download model (verified by SHA-256)
+        run: gesture-pilot download-model --quiet
+
+      - name: Run tests (no camera, no display)
+        run: python -m pytest -ra
+
+      - name: Smoke test the CLI
+        run: |
+          gesture-pilot --version
+          gesture-pilot preview --source test --max-frames 10 --no-window
+          gesture-pilot run --dry-run --source test --max-frames 10 --no-window --process-every 2 --detect-width 320
