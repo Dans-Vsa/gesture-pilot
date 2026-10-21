@@ -23,9 +23,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install system libraries for OpenCV
+      - name: Install system libraries for OpenCV and MediaPipe
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libegl1 libgles2
 
       - name: Install package
         run: python -m pip install -e ".[dev]"
