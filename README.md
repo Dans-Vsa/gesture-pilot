@@ -2,12 +2,16 @@
 
 Control your computer with hand gestures from a webcam.
 
+[![CI](https://github.com/Dans-Vsa/gesture-pilot/actions/workflows/ci.yml/badge.svg)](https://github.com/Dans-Vsa/gesture-pilot/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%E2%80%933.13-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 `gesture-pilot` tracks your hand in real time with [MediaPipe](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker)
 and [OpenCV](https://opencv.org/), recognises gestures (rule-based and trainable),
 and maps them to actions such as play/pause, volume, mouse movement and scrolling.
 Everything runs locally on the CPU — no cloud APIs, no API keys.
 
-> **Status:** in development (v0.3.0). Milestone 3 of 4 is done — see the roadmap below.
+> **Status:** v1.0.0 — all four milestones are done. See the [CHANGELOG](CHANGELOG.md).
 
 ## Features
 
@@ -22,7 +26,9 @@ Everything runs locally on the CPU — no cloud APIs, no API keys.
 - [x] Synthetic demo data — `record --synthetic N` generates samples of the built-in gestures, so you can try training without a camera
 - [x] Actions — TOML mapping from gestures to media keys, volume, key combos, clicks, scrolling and cursor movement (`init-config`, `run`)
 - [x] Safety — actions start disarmed, a toggle gesture arms/disarms them, optional left/right hand filter, `--dry-run` prints instead of acting
-- [ ] Polish — performance tuning, HUD, CI on Linux + Windows, v1.0.0
+- [x] Performance options — detect on every Nth frame (`--process-every`) and downscale frames before detection (`--detect-width`)
+- [x] HUD — on-screen panel with mode, gestures per hand, armed state and the last action (`--no-hud` to hide)
+- [x] CI — GitHub Actions on Linux + Windows, Python 3.10–3.13, no camera needed
 
 ## Tech stack
 
@@ -47,6 +53,32 @@ gesture-pilot download-model
 
 The model is saved to `models/hand_landmarker.task`. Use `--path` or the
 `GESTURE_PILOT_MODEL` environment variable to store it somewhere else.
+
+## Demo walkthrough
+
+A five-minute tour, from nothing to controlling your media player:
+
+```bash
+gesture-pilot download-model                 # 1. fetch the ~8 MB hand model once
+gesture-pilot preview                        # 2. check the camera works (q / Esc quits)
+gesture-pilot track                          # 3. see the 21-point hand skeleton
+gesture-pilot recognize                      # 4. show open palm, fist, peace, thumbs up ...
+gesture-pilot run --dry-run                  # 5. see which actions *would* fire
+gesture-pilot run                            # 6. for real: hold "ok" to arm, then open palm = play/pause
+```
+
+The HUD in the bottom-left corner shows what the program is doing:
+
+```
+mode: run  [detect 1/2, 320x240]     <- command and performance options
+ARMED                                 <- actions armed (green) or disarmed (grey)
+Right: open_palm                      <- per-frame gesture of each hand
+last: open_palm -> key:media_play_pause   <- last event/action, highlighted for 1.5 s
+```
+
+No webcam? Every command accepts `--source test` (synthetic pattern), a video
+file or an image, plus `--no-window --snapshot out.png` to save the annotated
+last frame.
 
 ## Usage
 
@@ -199,6 +231,25 @@ rock_on = "key:f5"    # custom gestures from `train` work too
 | `move[:speed]` | while held, the cursor follows the index fingertip (relative; `speed` = pixels per frame width, default 1500) |
 | `toggle` | arm / disarm the other actions (at most one; with none, actions are always armed) |
 
+### Performance
+
+On a slow laptop, trade a little accuracy for speed:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--process-every N` | 1 | run hand detection on every Nth frame and reuse the result in between |
+| `--detect-width PX` | full size | downscale frames to this width before detection (min 160); landmarks still map onto the full frame |
+| `--width` / `--height` | camera default | requested capture resolution |
+| `--max-hands N` | 2 | fewer hands = faster detection |
+| `--no-hud` | off | hide the status panel |
+
+```bash
+gesture-pilot run --process-every 2 --detect-width 320 --max-hands 1
+```
+
+With `--process-every 2` gestures need twice as many camera frames to become
+stable, so you may want a lower `--stable-frames` (or `stable_frames` in the config).
+
 ### How the rules work
 
 1. Landmarks are normalised: wrist → origin, divided by the palm size
@@ -214,6 +265,9 @@ rock_on = "key:f5"    # custom gestures from `train` work too
 ```bash
 python -m pytest
 ```
+
+CI runs the same suite on Linux and Windows for Python 3.10–3.13 (with the
+model downloaded, so the tracker tests run too) plus a few CLI smoke tests.
 
 The tests never open a camera or a window and never touch the network: the
 model downloader is tested against local `file://` URLs, the sources use
@@ -243,12 +297,16 @@ gesture-pilot/
 │   ├── config.py     # TOML gesture -> action mapping
 │   ├── controller.py # events -> actions, safety toggle, cursor movement
 │   ├── synthetic.py  # synthetic hand generator (tests, demo data)
+│   ├── perf.py       # frame skipping, downscaling before detection
+│   ├── hud.py        # on-screen status panel
 │   ├── fps.py        # smoothed FPS counter
 │   └── overlay.py    # labels, FPS badge, hand skeleton
 ├── tests/            # pytest suite (no camera required)
+├── .github/workflows/ci.yml  # tests on Linux + Windows, Python 3.10–3.13
 ├── models/           # downloaded / trained models (git-ignored)
 ├── data/             # recorded datasets (git-ignored)
 ├── pyproject.toml
+├── CHANGELOG.md
 └── LICENSE
 ```
 
@@ -257,7 +315,10 @@ gesture-pilot/
 1. ✅ Scaffold, model downloader, frame sources, `preview`
 2. ✅ Hand tracking, landmark normalisation, rule-based gestures with smoothing/debounce (`track`, `recognize`)
 3. ✅ Trainable gestures (`record`, `train`) and gesture → action mappings (`init-config`, `run`, `--dry-run`)
-4. Polish: performance options, HUD, CI, CHANGELOG, v1.0.0
+4. ✅ Polish: performance options, HUD, CI, CHANGELOG, v1.0.0
+
+Future ideas: two-hand gestures (e.g. zoom with both hands), dynamic gestures
+(swipes) from landmark trajectories, a small GUI for editing the mapping.
 
 ## License
 
