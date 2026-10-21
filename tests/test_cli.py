@@ -111,3 +111,30 @@ def test_recognize_headless_on_test_pattern(capsys: pytest.CaptureFixture[str]) 
     )
     assert code == 0
     assert "0 gesture events" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("extra", [["--process-every", "0"], ["--detect-width", "100"]])
+def test_tracking_rejects_bad_performance_options(extra: list[str]) -> None:
+    with pytest.raises(SystemExit):
+        main(["track", *extra])
+
+
+@needs_model
+def test_recognize_with_frame_skipping_and_hud(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    snap = tmp_path / "hud.png"
+    code = main(
+        ["recognize", "--source", "test", "--width", "320", "--height", "240", "--max-frames", "6",
+         "--process-every", "3", "--detect-width", "160", "--no-window",
+         "--model-path", str(LOCAL_MODEL), "--snapshot", str(snap)]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "6 frames" in out
+    assert "detection on 2 frames" in out
+    with_hud = cv2.imread(str(snap))
+    assert with_hud.shape == (240, 320, 3)
+
+    plain = tmp_path / "plain.png"
+    main(["recognize", "--source", "test", "--width", "320", "--height", "240", "--max-frames", "6",
+          "--no-hud", "--no-window", "--model-path", str(LOCAL_MODEL), "--snapshot", str(plain)])
+    assert not (cv2.imread(str(plain))[-20:, :40] == with_hud[-20:, :40]).all()

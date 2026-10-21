@@ -197,6 +197,24 @@ def _add_tracker_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--no-window", action="store_true", help="headless: process frames without a window")
     parser.add_argument("--snapshot", type=Path, help="save the last processed frame to this image file")
+    parser.add_argument(
+        "--process-every", type=_positive_int, default=1, metavar="N",
+        help="run hand detection on every Nth frame only and reuse the result in between (default: 1)",
+    )
+    parser.add_argument(
+        "--detect-width", type=_detect_width, metavar="PX",
+        help="downscale frames to this width before detection, e.g. 320 (default: full size)",
+    )
+    parser.add_argument("--no-hud", action="store_true", help="hide the on-screen status panel")
+
+
+def _detect_width(value: str) -> int:
+    from gesture_pilot.perf import MIN_DETECT_WIDTH
+
+    number = int(value)
+    if number < MIN_DETECT_WIDTH:
+        raise argparse.ArgumentTypeError(f"must be at least {MIN_DETECT_WIDTH}")
+    return number
 
 
 def _add_source_args(parser: argparse.ArgumentParser) -> None:
@@ -315,7 +333,9 @@ def _run_tracking(args: argparse.Namespace, *, mode: str) -> int:
     from gesture_pilot.dataset import sample_row
     from gesture_pilot.fps import FPSCounter
     from gesture_pilot.gestures import NONE
+    from gesture_pilot.hud import HudState, draw_hud
     from gesture_pilot.overlay import draw_fps, draw_hand, draw_label
+    from gesture_pilot.perf import FrameSkipper, detection_size, prepare_for_detection
     from gesture_pilot.smoothing import LandmarkSmoother, MultiHandStabilizer
     from gesture_pilot.sources import CameraSource, SourceError, open_source
     from gesture_pilot.tracker import HandTracker, TrackerError
@@ -378,6 +398,9 @@ def _run_tracking(args: argparse.Namespace, *, mode: str) -> int:
     smoother = LandmarkSmoother(args.smoothing) if mode != "track" else None
     stabilizer = MultiHandStabilizer(stable_frames, cooldown) if recognize else None
     counter = FPSCounter()
+    skipper = FrameSkipper(args.process_every)
+    hud = HudState(mode, process_every=args.process_every, dry_run=getattr(args, "dry_run", False))
+    detected: list = []
     start = time.monotonic()
     record_after = args.delay if mode == "record" and source.live else 0.0
     rows: list[list[str]] = []
@@ -393,7 +416,10 @@ def _run_tracking(args: argparse.Namespace, *, mode: str) -> int:
                 timestamp_ms = int((time.monotonic() - start) * 1000)
             else:
                 timestamp_ms = int(index * frame_ms)
-            hands = tracker.detect(frame, timestamp_ms)
+            fresh = skipper.should_process(index)
+            if fresh:
+                detected = tracker.detect(prepare_for_detection(frame, args.detect_width), timestamp_ms)
+            hands = detected
             if hands:
                 frames_with_hands += 1
             if smoother is not None:
@@ -406,10 +432,13 @@ def _run_tracking(args: argparse.Namespace, *, mode: str) -> int:
                 for event in stabilizer.update(labels, timestamp_ms / 1000):
                     events += 1
                     line = f"{event.timestamp:8.2f}s  {event.handedness:<5}  {event.gesture}"
+                    shown = f"{event.handedness} {event.gesture}"
                     if controller is not None:
                         message = controller.handle_event(event)
                         if message:
                             line += f"  [{message}]"
+                            shown = message
+                    hud.set_action(shown, timestamp_ms / 1000)
                     print(line, flush=True)
                 if controller is not None:
                     controller.update_frame(hands, labels)
@@ -418,12 +447,12 @@ def _run_tracking(args: argparse.Namespace, *, mode: str) -> int:
                     held = stabilizer.active(hand.handedness)
                     marker = " *" if held != NONE and held == gesture else ""
                     draw_hand(frame, hand, label=f"{hand.handedness}: {gesture}{marker}")
+                hud.gestures = labels
                 if controller is not None:
-                    draw_label(frame, "ARMED" if controller.armed else "disarmed", (10, 70),
-                               color=(80, 220, 80) if controller.armed else (160, 160, 160))
+                    hud.armed = controller.armed
             elif mode == "record":
                 waiting = timestamp_ms / 1000 < record_after
-                if hands and not waiting and index % args.every == 0 and len(rows) < args.samples:
+                if hands and fresh and not waiting and index % args.every == 0 and len(rows) < args.samples:
                     rows.append(sample_row(args.label, hands[0]))
                 for hand in hands:
                     draw_hand(frame, hand, label=args.label)
@@ -437,6 +466,10 @@ def _run_tracking(args: argparse.Namespace, *, mode: str) -> int:
             draw_fps(frame, counter.tick())
             if not hands:
                 draw_label(frame, "no hand", (10, 44), color=(120, 120, 255))
+            if not args.no_hud:
+                if args.detect_width and hud.detect_size is None:
+                    hud.detect_size = detection_size(frame.shape[1], frame.shape[0], args.detect_width)
+                draw_hud(frame, hud, timestamp_ms / 1000)
             last = frame
             if not args.no_window:
                 cv2.imshow(WINDOW_TITLE, frame)
@@ -459,6 +492,8 @@ def _run_tracking(args: argparse.Namespace, *, mode: str) -> int:
         f"{source.name}: {counter.frames} frames, hands in {frames_with_hands} ({rate:.0f}%), "
         f"average {counter.average:.1f} FPS"
     )
+    if skipper.every > 1:
+        summary += f", detection on {skipper.processed} frames"
     if recognize:
         summary += f", {events} gesture events"
     print(summary)
