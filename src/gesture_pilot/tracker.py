@@ -11,6 +11,9 @@ from gesture_pilot.landmarks import Hand
 from gesture_pilot.model import default_model_path
 
 
+LINUX_HINT = " (on Debian/Ubuntu: sudo apt-get install libegl1 libgles2 libgl1)"
+
+
 class TrackerError(RuntimeError):
     """Raised when the hand tracker cannot be created."""
 
@@ -37,7 +40,10 @@ class HandTracker:
         if not path.is_file():
             raise TrackerError(f"model not found: {path} (run `gesture-pilot download-model` first)")
 
-        from mediapipe.tasks.python import BaseOptions, vision
+        try:
+            from mediapipe.tasks.python import BaseOptions, vision
+        except OSError as exc:  # e.g. libEGL.so.1 / libGLESv2.so.2 missing on headless Linux
+            raise TrackerError(f"MediaPipe could not load a system library: {exc}{LINUX_HINT}") from exc
 
         options = vision.HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=str(path)),
@@ -49,6 +55,8 @@ class HandTracker:
         )
         try:
             self._landmarker = vision.HandLandmarker.create_from_options(options)
+        except OSError as exc:
+            raise TrackerError(f"MediaPipe could not load a system library: {exc}{LINUX_HINT}") from exc
         except (RuntimeError, ValueError) as exc:
             raise TrackerError(f"could not load model {path}: {exc}") from exc
         self.model_path = path

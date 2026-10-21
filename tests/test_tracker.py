@@ -53,3 +53,17 @@ def test_draw_hand_draws_skeleton_and_label() -> None:
     assert frame[:, :, 1].sum() > 0
     # Nothing is drawn far away from the hand.
     assert not frame[:, :40].any()
+
+
+def test_missing_system_library_becomes_tracker_error(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    from mediapipe.tasks.python import vision
+
+    model_file = tmp_path / "hand.task"
+    model_file.write_bytes(b"not really a model")
+
+    def boom(options: object) -> None:
+        raise OSError("libEGL.so.1: cannot open shared object file")
+
+    monkeypatch.setattr(vision.HandLandmarker, "create_from_options", boom)
+    with pytest.raises(TrackerError, match="libegl1"):
+        HandTracker(model_file)
