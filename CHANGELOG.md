@@ -22,6 +22,10 @@ and the project follows [Semantic Versioning](https://semver.org/).
   skipping never produces duplicate samples.
 - The summary line reports how many frames were detected when frame skipping is on.
 
+### Fixed
+- A missing system library (e.g. `libEGL.so.1` on headless Linux) is reported as a
+  clear `error:` with the packages to install instead of a Python traceback.
+
 ## [0.3.0] - 2026-10-20
 
 ### Added

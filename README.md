@@ -51,6 +51,9 @@ pip install -e ".[dev]"
 gesture-pilot download-model
 ```
 
+On headless Debian/Ubuntu machines MediaPipe and OpenCV also need a few system
+libraries: `sudo apt-get install libegl1 libgles2 libgl1 libglib2.0-0`.
+
 The model is saved to `models/hand_landmarker.task`. Use `--path` or the
 `GESTURE_PILOT_MODEL` environment variable to store it somewhere else.
 
